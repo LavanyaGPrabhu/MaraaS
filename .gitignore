@@ -12,6 +12,7 @@
 .swiftpm/
 migrate_working_dir/
 /local.properties
+/android/app/google-services.json
 
 # IntelliJ related
 *.iml

@@ -6,7 +6,6 @@ import '../models/location_model.dart';
 import '../services/firestore_service.dart';
 import '../services/auth_service.dart';
 
-
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
 
@@ -17,37 +16,31 @@ class MapScreen extends StatefulWidget {
 class _MapScreenState extends State<MapScreen> {
   final _fs = FirestoreService();
   final _auth = AuthService();
-  final _window = const Duration(minutes: 30);
 
   GoogleMapController? _map;
   StreamSubscription<List<MaraaSLocation>>? _locSub;
 
   List<MaraaSLocation> _locations = [];
-  Map<String, int> _counts = {};
   final Set<String> _userCheckedInLocations = {};
   Set<Marker> _markers = {};
-  Timer? _pollTimer;
 
   // Center on the campus
-  static const LatLng _campusCenter = LatLng(13.3539, 74.7923); // Example: Manipal area
-  static const CameraPosition _initialCamera = CameraPosition(target: _campusCenter, zoom: 15);
+  static const LatLng _campusCenter = LatLng(13.352685344586105, 74.7927248560112); // Example: Manipal area
+  static const CameraPosition _initialCamera = CameraPosition(target: _campusCenter, zoom: 14);
 
   @override
   void initState() {
     super.initState();
     _locSub = _fs.locationsStream().listen((locs) {
       setState(() => _locations = locs);
-      _refreshCounts(); // update markers whenever locations change
+      _refreshMarkers();
     });
-
-    // Refresh counts periodically to simulate "live" crowd without complex streams
-    _pollTimer = Timer.periodic(const Duration(seconds: 15), (_) => _refreshCounts());
+    _loadUserCheckins();
   }
 
   @override
   void dispose() {
     _locSub?.cancel();
-    _pollTimer?.cancel();
     _map?.dispose();
     super.dispose();
   }
@@ -62,56 +55,77 @@ class _MapScreenState extends State<MapScreen> {
     if (percent <= 90) return BitmapDescriptor.hueOrange;
     return BitmapDescriptor.hueRed;
   }
+  Future<void> _loadUserCheckins() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
 
-  Future<void> _refreshCounts() async {
-    final newCounts = <String, int>{};
-    for (final loc in _locations) {
-      final id = loc.id!;
-      final c = await _fs.countRecent(id, _window);
-      newCounts[id] = c;
-    }
-    if (!mounted) return;
+    final active = await _fs.activeCheckinsForUser(user.uid);
+    setState(() {
+      _userCheckedInLocations
+        ..clear()
+        ..addAll(active);
+    });
+  }
 
+  void _refreshMarkers() {
     final newMarkers = _locations.map((loc) {
-      final c = newCounts[loc.id] ?? 0;
+      final c = loc.currentCount;
       final hue = _countToHue(c, loc.capacity);
 
       return Marker(
         markerId: MarkerId(loc.id!),
         position: LatLng(loc.lat, loc.lng),
         icon: (hue != null)
-          ? BitmapDescriptor.defaultMarkerWithHue(hue)
-          : BitmapDescriptor.defaultMarker, // grey/default for 0
-        infoWindow: InfoWindow(title: loc.name, snippet: '$c people (last ${_window.inMinutes} min)'),
+            ? BitmapDescriptor.defaultMarkerWithHue(hue)
+            : BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure), // grey/default for 0
+        infoWindow: InfoWindow(title: loc.name, snippet: '$c people here'),
       );
     }).toSet();
 
-    setState(() {
-      _counts = newCounts;
-      _markers = newMarkers;
-    });
+    setState(() => _markers = newMarkers);
   }
 
   Future<void> _toggleCheckin(MaraaSLocation loc) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
-    // Check if this user is already checked in at this location
-    final existing = await _fs.checkinsForUserAtLocation(user.uid, loc.id!);
+    // Fetch all active checkins for this user
+    final existingCheckins = await _fs.checkinsForUser(user.uid);
 
-    if (existing.isNotEmpty) {
-      // Already checked in → perform check out
-      await _fs.deleteCheckin(userId: user.uid, locationId: loc.id!);
-      _userCheckedInLocations.remove(loc.id);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Checked out from ${loc.name}')),
-        );
+    if (existingCheckins.isNotEmpty) {
+      final currentLocId = existingCheckins.first['locationId'] as String;
+
+      if (currentLocId == loc.id) {
+        // ✅ Same location → Check out
+        await _fs.deleteCheckin(userId: user.uid, locationId: loc.id!);
+        _userCheckedInLocations.remove(loc.id);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Checked out from ${loc.name}')),
+          );
+        }
+      } else {
+        // ✅ Different location → Check out old, then check in new
+        await _fs.deleteCheckin(userId: user.uid, locationId: currentLocId);
+        await _fs.createOrUpdateCheckin(userId: user.uid, locationId: loc.id!);
+
+        _userCheckedInLocations
+          ..clear()
+          ..add(loc.id!);
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Moved to ${loc.name}')),
+          );
+        }
       }
     } else {
-      // Not checked in → perform check in
+      // ✅ No checkins yet → Check in new one
       await _fs.createOrUpdateCheckin(userId: user.uid, locationId: loc.id!);
-      _userCheckedInLocations.add(loc.id!);
+      _userCheckedInLocations
+        ..clear()
+        ..add(loc.id!);
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Checked in at ${loc.name}')),
@@ -119,15 +133,16 @@ class _MapScreenState extends State<MapScreen> {
       }
     }
 
-    _refreshCounts();
+    _refreshMarkers();
   }
+
 
   Future<void> _seedLocations() async {
     final locations = <MaraaSLocation>[
       MaraaSLocation(name: 'MIT Central Library', lat: 13.351644615065558, lng: 74.79318464966113, capacity: 10),
-      MaraaSLocation(name: 'Cafeteria',    lat: 13.352100993465228, lng: 74.79327307984387, capacity: 8),
-      MaraaSLocation(name: 'MIT Library Auditorium',   lat: 13.35167498897573, lng: 74.79340185142415, capacity: 6),
-      MaraaSLocation(name: 'MIT Food Court 1',    lat: 13.347629387600533, lng: 74.79398186579219, capacity: 8),
+      MaraaSLocation(name: 'Cafeteria', lat: 13.352100993465228, lng: 74.79327307984387, capacity: 8),
+      MaraaSLocation(name: 'MIT Library Auditorium', lat: 13.35167498897573, lng: 74.79340185142415, capacity: 6),
+      MaraaSLocation(name: 'MIT Food Court 1', lat: 13.347629387600533, lng: 74.79398186579219, capacity: 8),
       MaraaSLocation(name: 'MIT Food Court 2', lat: 13.345607252334947, lng: 74.79608645075419, capacity: 8),
       MaraaSLocation(name: 'Apoorva Mess', lat: 13.346031868206662, lng: 74.79488146272743, capacity: 4),
     ];
@@ -148,20 +163,28 @@ class _MapScreenState extends State<MapScreen> {
             itemBuilder: (context, i) {
               final loc = _locations[i];
               final isCheckedIn = _userCheckedInLocations.contains(loc.id);
-              final c = _counts[loc.id] ?? 0;
+              final c = loc.currentCount;
 
-              Color dot = Colors.grey;
-              if (c > 1) {dot = Colors.green;}
-              else if (c > 6) {dot = Colors.red;}
-              else if (c > 4) {dot = Colors.orange;}
-              else if (c > 2) {dot = Colors.yellow;}
+              // Dot color logic
+              Color dot;
+              if (c == 0) {
+                dot = Colors.grey;
+              } else if (c / loc.capacity <= 0.2) {
+                dot = Colors.green;
+              } else if (c / loc.capacity <= 0.6) {
+                dot = Colors.yellow;
+              } else if (c / loc.capacity <= 0.9) {
+                dot = Colors.orange;
+              } else {
+                dot = Colors.red;
+              }
 
               return ListTile(
                 title: Text(loc.name),
-                subtitle: Text('$c people (last ${_window.inMinutes} min)'),
+                subtitle: Text('$c people here'),
                 leading: CircleAvatar(backgroundColor: dot),
                 trailing: FilledButton(
-                  onPressed: () { 
+                  onPressed: () {
                     Navigator.pop(context);
                     _toggleCheckin(loc);
                   },
@@ -198,7 +221,7 @@ class _MapScreenState extends State<MapScreen> {
       body: GoogleMap(
         initialCameraPosition: _initialCamera,
         markers: _markers,
-        onMapCreated: (c) => _map = c,
+        onMapCreated: (GoogleMapController c) => _map = c,
         myLocationButtonEnabled: false,
         myLocationEnabled: false, // set true after adding geolocator permission & logic
       ),
